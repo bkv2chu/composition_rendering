@@ -570,9 +570,12 @@ def main():
         'glbs_rescale': True,
         'glbs_random_sample': True,
         'glbs_per_scene': 2,
+        'glbs_max_sample_tries_per_scene': None,
         'glbs_scale_range': [1.0, 1.5],
         'glbs_rotation_range': [-45, 45],
         'glbs_placement_bbox': [-1.0, -1.0, 1.0, 1.0],
+        'glbs_z_offset_range': None,
+        'scene_compose_retry_limit': 10,
         'shapes_per_scene': 3,
         'shapes_scale_range': [0.3, 0.8],
         'shapes_rotation_range': [-45, 45],
@@ -588,6 +591,19 @@ def main():
         'envlight_sample_weight': None,
         'texture_sample_weight': None,
         'placement_plane_textures': None,
+        'enclosure': {
+            'enabled': False,
+            'size': None,
+            'height': 2.0,
+            'thickness': 0.1,
+            'floor_thickness': 0.1,
+            'ceiling': False,
+            'procedural_floor': True,
+            'seam_epsilon': 0.001,
+            'color': [0.85, 0.85, 0.85],
+            'roughness': 0.8,
+            'metallic': 0.0,
+        },
         'prefix_in_folder': False,
         # Unsupported/unused but kept for completeness
         'analytical_sky': False,
@@ -686,6 +702,8 @@ def main():
         num_materials = ref_mesh.get_num_materials()
         if num_materials == 0:
             logger.info(f'Mesh {mesh_name} has invalid materials {num_materials}')
+            ref_mesh.clear_objects()
+            del ref_mesh
             return None
 
         # Sample the object rotation
@@ -697,6 +715,25 @@ def main():
         vmin, vmax = vmin * smpl_scale, vmax * smpl_scale
         mesh_center = np.array((vmax + vmin) * 0.5)
         cz = (mesh_center[2] - vmin[2])
+        z_offset = 0.0
+        if FLAGS.glbs_z_offset_range is not None:
+            z_min, z_max = [float(v) for v in FLAGS.glbs_z_offset_range]
+            if z_min > z_max:
+                raise ValueError(f"Invalid glbs_z_offset_range: {FLAGS.glbs_z_offset_range}")
+            effective_z_max = z_max
+            if FLAGS.enclosure is not None and FLAGS.enclosure.get('enabled', False):
+                room_height = float(FLAGS.enclosure.get('height', 2.0))
+                mesh_height = float(vmax[2] - vmin[2])
+                effective_z_max = min(effective_z_max, max(0.0, room_height - mesh_height))
+            if effective_z_max < z_min:
+                logger.info(
+                    f'Mesh {mesh_name} cannot satisfy z-offset range {FLAGS.glbs_z_offset_range}'
+                )
+                ref_mesh.clear_objects()
+                del ref_mesh
+                return None
+            z_offset = float(np.random.uniform(z_min, effective_z_max))
+            cz = cz + z_offset
         mesh_bounds = np.array(vmax - vmin)[:2]
         if FLAGS.video_mode == 'rotat_obj':
             # use square bbox
@@ -708,6 +745,11 @@ def main():
         mesh_placement_vmax =  glbs_placement_vmax - mesh_bounds * 0.5
 
         if not FLAGS.placement_centered:
+            if np.any(mesh_placement_vmin > mesh_placement_vmax):
+                logger.info(f'Mesh {mesh_name} is too large for placement bbox')
+                ref_mesh.clear_objects()
+                del ref_mesh
+                return None
             # Sample the object placement
             find_placement = False
             for t in range(5): # 8 tries
@@ -745,7 +787,8 @@ def main():
             'translation': smpl_translation.tolist(),
             'rotation': smpl_rot_deg,
             'scale': smpl_scale,
-            'num_materials': num_materials
+            'num_materials': num_materials,
+            'z_offset': z_offset,
         }
 
         return ref_mesh, placement_meta
@@ -861,6 +904,13 @@ def main():
         check_bbox=FLAGS.glbs_check_bbox
     )
     logger.info(f"Use {len(obj_dataloader)} glbs")
+    if FLAGS.glbs_max_sample_tries_per_scene is None:
+        FLAGS.glbs_max_sample_tries_per_scene = max(FLAGS.glbs_per_scene * 25, 50)
+    logger.info(
+        f"Will place exactly {FLAGS.glbs_per_scene} GLBs per scene with up to "
+        f"{FLAGS.glbs_max_sample_tries_per_scene} GLB samples per attempt and "
+        f"{FLAGS.scene_compose_retry_limit} scene retries"
+    )
 
     # envlight 
     env_src = os.path.abspath(FLAGS.envlight)
@@ -888,69 +938,280 @@ def main():
             baseshape_files = [os.path.abspath(p) for p in glob.glob(os.path.join(bsp, "*.glb"))]
         else:
             baseshape_files = [bsp]
+
+    def create_principled_material(name, base_color, roughness, metallic):
+        material = bpy.data.materials.new(name=name)
+        material.use_nodes = True
+        nodes = material.node_tree.nodes
+        links = material.node_tree.links
+        nodes.clear()
+
+        output = nodes.new(type='ShaderNodeOutputMaterial')
+        output.location = (200, 0)
+        principled = nodes.new(type='ShaderNodeBsdfPrincipled')
+        principled.location = (0, 0)
+        links.new(principled.outputs['BSDF'], output.inputs['Surface'])
+        principled.inputs['Base Color'].default_value = (
+            float(base_color[0]), float(base_color[1]), float(base_color[2]), 1.0
+        )
+        principled.inputs['Roughness'].default_value = float(roughness)
+        principled.inputs['Metallic'].default_value = float(metallic)
+        return material
+
+    def add_box_primitive(name, size_xyz, location, material, flip_normals=False):
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=location)
+        obj = bpy.context.active_object
+        obj.name = name
+        obj.scale = Vector((size_xyz[0], size_xyz[1], size_xyz[2]))
+        bpy.context.view_layer.update()
+        if flip_normals:
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.mesh.flip_normals()
+            bpy.ops.object.mode_set(mode='OBJECT')
+        obj.data.materials.clear()
+        obj.data.materials.append(material)
+        return obj
+
+    def add_floor_slab(
+        scene_name,
+        size_xy,
+        center_xy,
+        top_z,
+        thickness,
+        texture_path=None,
+        texture_scale=None,
+        source_name=None,
+    ):
+        enclosure_cfg = FLAGS.enclosure if FLAGS.enclosure is not None else {}
+        floor_color = enclosure_cfg.get('color', [0.85, 0.85, 0.85])
+        floor_roughness = float(enclosure_cfg.get('roughness', 0.8))
+        floor_metallic = float(enclosure_cfg.get('metallic', 0.0))
+
+        size_x, size_y = float(size_xy[0]), float(size_xy[1])
+        center_x, center_y = float(center_xy[0]), float(center_xy[1])
+        floor_obj = add_box_primitive(
+            f"{scene_name}_floor",
+            (size_x, size_y, float(thickness)),
+            (center_x, center_y, float(top_z) - float(thickness) / 2.0),
+            create_principled_material(
+                f"FloorMaterial_{scene_name}", floor_color, floor_roughness, floor_metallic
+            ),
+            flip_normals=False,
+        )
+        floor_container = blender_utils.ObjContainer(
+            [floor_obj], with_empty=False, recenter=False, rescale=False, file_name=source_name
+        )
+        if texture_path is not None:
+            floor_container.apply_texture(texture_path, texture_scale if texture_scale is not None else 1.0)
+        floor_meta = {
+            'name': floor_obj.name,
+            'kind': 'floor',
+            'translation': [float(center_x), float(center_y), float(top_z) - float(thickness) / 2.0],
+            'size': [size_x, size_y, float(thickness)],
+        }
+        if source_name is not None:
+            floor_meta['source'] = source_name
+        if texture_path is not None:
+            floor_meta['texture'] = texture_path
+            floor_meta['texture_scale'] = texture_scale
+        return floor_container, floor_meta
+
+    def add_enclosure(scene_name, floor_bounds=None, floor_top_z=None, source_name=None):
+        enclosure_cfg = FLAGS.enclosure if FLAGS.enclosure is not None else {}
+        if not enclosure_cfg.get('enabled', False):
+            return []
+
+        size_xy = enclosure_cfg.get('size')
+        center_x = float((placement_vmin[0] + placement_vmax[0]) * 0.5)
+        center_y = float((placement_vmin[1] + placement_vmax[1]) * 0.5)
+        floor_z = float(placement_plane_offset[2])
+        if floor_bounds is not None:
+            floor_vmin = np.array(floor_bounds[0], dtype=np.float32)
+            floor_vmax = np.array(floor_bounds[1], dtype=np.float32)
+            center_x = float((floor_vmin[0] + floor_vmax[0]) * 0.5)
+            center_y = float((floor_vmin[1] + floor_vmax[1]) * 0.5)
+            floor_z = float(floor_vmax[2])
+        if floor_top_z is not None:
+            floor_z = float(floor_top_z)
+        if size_xy is None:
+            if floor_bounds is not None:
+                size_xy = (floor_vmax - floor_vmin)[:2].tolist()
+            else:
+                size_xy = placement_range.tolist()
+        size_x, size_y = float(size_xy[0]), float(size_xy[1])
+        wall_height = float(enclosure_cfg.get('height', 2.0))
+        wall_thickness = float(enclosure_cfg.get('thickness', 0.1))
+        seam_epsilon = float(enclosure_cfg.get('seam_epsilon', 0.001))
+        include_ceiling = bool(enclosure_cfg.get('ceiling', False))
+        wall_color = enclosure_cfg.get('color', [0.85, 0.85, 0.85])
+        wall_roughness = float(enclosure_cfg.get('roughness', 0.8))
+        wall_metallic = float(enclosure_cfg.get('metallic', 0.0))
+
+        if size_x <= 0 or size_y <= 0 or wall_height <= 0 or wall_thickness <= 0:
+            raise ValueError(f"Invalid enclosure dimensions: {enclosure_cfg}")
+
+        wall_material = create_principled_material(
+            f"EnclosureMaterial_{scene_name}", wall_color, wall_roughness, wall_metallic
+        )
+        enclosure_meta = []
+        wall_height_with_seam = wall_height + seam_epsilon
+        wall_center_z = floor_z + wall_height * 0.5 - seam_epsilon * 0.5
+        box_specs = [
+            (
+                'wall_south',
+                (size_x, wall_thickness, wall_height_with_seam),
+                (center_x, center_y - size_y / 2.0 - wall_thickness / 2.0, wall_center_z),
+            ),
+            (
+                'wall_north',
+                (size_x, wall_thickness, wall_height_with_seam),
+                (center_x, center_y + size_y / 2.0 + wall_thickness / 2.0, wall_center_z),
+            ),
+            (
+                'wall_west',
+                (wall_thickness, size_y, wall_height_with_seam),
+                (center_x - size_x / 2.0 - wall_thickness / 2.0, center_y, wall_center_z),
+            ),
+            (
+                'wall_east',
+                (wall_thickness, size_y, wall_height_with_seam),
+                (center_x + size_x / 2.0 + wall_thickness / 2.0, center_y, wall_center_z),
+            ),
+        ]
+        if include_ceiling:
+            box_specs.append(
+                (
+                    'ceiling',
+                    (size_x, size_y, wall_thickness),
+                    (center_x, center_y, floor_z + wall_height - seam_epsilon + wall_thickness / 2.0),
+                )
+            )
+
+        for part_name, size_xyz, location in box_specs:
+            obj = add_box_primitive(
+                f"{scene_name}_{part_name}", size_xyz, location, wall_material, flip_normals=True
+            )
+            part_meta = {
+                'name': obj.name,
+                'kind': part_name,
+                'translation': [float(v) for v in location],
+                'size': [float(v) for v in size_xyz],
+                'base_color': [float(v) for v in wall_color],
+                'roughness': wall_roughness,
+                'metallic': wall_metallic,
+            }
+            if source_name is not None:
+                part_meta['source'] = source_name
+            enclosure_meta.append(part_meta)
+
+        logger.info(
+            f"Added enclosure for scene {scene_name}: size=({size_x}, {size_y}), "
+            f"height={wall_height}, ceiling={include_ceiling}"
+        )
+        return enclosure_meta
     
     start_idx = 0
     iter_start_time = time.time()
     obj_iter = iter(obj_dataloader)
-    for i in range(start_idx, FLAGS.num_rendering):
-        logger.info(f"Rendering iteration {i}/{FLAGS.num_rendering}")
-        name = f"{i:06d}"
-        if FLAGS.dump_complete:
-            new_complete_file = os.path.join(FLAGS.out_dir, f"COMPLETE_{name}")
-            if os.path.exists(new_complete_file):
-                logger.info(f"COMPLETE_{name} already exists, skip")
-                continue
-        prefix = ''
-        if FLAGS.num_frames > 1:
-            prefix = f"{0:04d}."
-        placement_grid = placement_grid * 0
+
+    def compose_scene(scene_name):
+        placement_grid.fill(0)
         blender_utils.clear_scene()
         mesh_list = []
         mesh_meta = []
+        floor_bounds = None
+        floor_top_z = float(placement_plane_offset[2])
+        floor_source_name = None
 
         # sample placement plane
         if num_planes > 0:
             plane_idx = np.random.choice(num_planes, size=1, p=FLAGS.plane_sample_weight)[0]
-            # insert plane 
-            placement_plane = blender_utils.add_object_file(placement_plane_path[plane_idx], with_empty=True, recenter=True, rescale=True)
+            placement_plane = blender_utils.add_object_file(
+                placement_plane_path[plane_idx], with_empty=True, recenter=True, rescale=True
+            )
             placement_plane.apply_transform((0, 0, 0), scale=placement_plane_scale)
             plane_vmin, plane_vmax = placement_plane.aabb
             vz = plane_vmin[2]
             vplane = np.array(placement_plane_offset) - np.array([0, 0, vz])
             placement_plane.apply_transform(vplane)
-            # 
-            plane_meta = {'name': os.path.basename(placement_plane_path[plane_idx])}
-            # sample the plane texture...
+
+            plane_source_name = os.path.basename(placement_plane_path[plane_idx])
+            floor_source_name = plane_source_name
+            plane_meta = {'name': plane_source_name}
+            plane_texture_path = None
+            texture_scale = None
             if num_plane_textures > 0:
-                plane_tex_idx = np.random.choice(num_plane_textures, size=1, p=FLAGS.texture_sample_weight)[0]
-                texture_scale = np.random.uniform(1.5, 2.5)
-                placement_plane.apply_texture(plane_textures_path[plane_tex_idx], texture_scale)
-                plane_meta['texture'] = plane_textures_path[plane_tex_idx]
-                plane_meta['texture_scale'] = texture_scale
+                plane_tex_idx = np.random.choice(
+                    num_plane_textures, size=1, p=FLAGS.texture_sample_weight
+                )[0]
+                texture_scale = float(np.random.uniform(1.5, 2.5))
+                plane_texture_path = plane_textures_path[plane_tex_idx]
+
+            enclosure_cfg = FLAGS.enclosure if FLAGS.enclosure is not None else {}
+            use_procedural_floor = enclosure_cfg.get('enabled', False) and enclosure_cfg.get('procedural_floor', True)
+            if use_procedural_floor:
+                plane_bounds = placement_plane.aabb
+                plane_center = (np.array(plane_bounds[0][:2]) + np.array(plane_bounds[1][:2])) * 0.5
+                floor_size_xy = enclosure_cfg.get('size')
+                if floor_size_xy is None:
+                    floor_size_xy = (np.array(plane_bounds[1][:2]) - np.array(plane_bounds[0][:2])).tolist()
+                floor_thickness = float(enclosure_cfg.get('floor_thickness', enclosure_cfg.get('thickness', 0.1)))
+                placement_plane.clear_objects()
+                del placement_plane
+                placement_plane, plane_meta = add_floor_slab(
+                    scene_name,
+                    floor_size_xy,
+                    plane_center,
+                    floor_top_z,
+                    floor_thickness,
+                    texture_path=plane_texture_path,
+                    texture_scale=texture_scale,
+                    source_name=plane_source_name,
+                )
+            else:
+                if plane_texture_path is not None:
+                    placement_plane.apply_texture(plane_texture_path, texture_scale)
+                    plane_meta['texture'] = plane_texture_path
+                    plane_meta['texture_scale'] = texture_scale
+
+            floor_bounds = placement_plane.aabb
+            floor_top_z = float(floor_bounds[1][2])
             mesh_meta.append(plane_meta)
             mesh_list.append(placement_plane)
 
-        # add glbs
-        for j in range(FLAGS.glbs_per_scene):
-            target = sample_glb(obj_iter, obj_idx=j)
-            if target is not None:
-                ref_mesh, meta = target
-                mesh_list.append(ref_mesh)
-                mesh_meta.append(meta)
+        num_glbs = 0
+        glb_attempts = 0
+        while num_glbs < FLAGS.glbs_per_scene and glb_attempts < FLAGS.glbs_max_sample_tries_per_scene:
+            target = sample_glb(obj_iter, obj_idx=num_glbs)
+            glb_attempts += 1
+            if target is None:
+                continue
+            ref_mesh, meta = target
+            mesh_list.append(ref_mesh)
+            mesh_meta.append(meta)
+            num_glbs += 1
 
+        if num_glbs < FLAGS.glbs_per_scene:
+            logger.warning(
+                f"Scene {scene_name}: placed {num_glbs}/{FLAGS.glbs_per_scene} GLBs after "
+                f"{glb_attempts} samples"
+            )
+            return None, None
 
-        num_glbs = len(mesh_list) - 1
         shape_list = []
         shape_meta = []
         for j in range(FLAGS.shapes_per_scene):
-            target = sample_shape(baseshape_files, obj_idx=j+num_glbs)
+            target = sample_shape(baseshape_files, obj_idx=j + num_glbs)
             if target is not None:
                 ref_mesh, meta = target
                 shape_list.append(ref_mesh)
 
                 if FLAGS.sample_shape_texture and num_plane_textures > 0:
                     if random.random() < 0.25:
-                        plane_tex_idx = np.random.choice(num_plane_textures, size=1, p=FLAGS.texture_sample_weight)[0]
+                        plane_tex_idx = np.random.choice(
+                            num_plane_textures, size=1, p=FLAGS.texture_sample_weight
+                        )[0]
                         texture_scale = 1.0
                         ref_mesh.apply_texture(plane_textures_path[plane_tex_idx], texture_scale)
                         meta['texture'] = plane_textures_path[plane_tex_idx]
@@ -962,6 +1223,48 @@ def main():
             mesh_meta.extend(shape_meta)
         else:
             logger.info("No shapes added")
+
+        enclosure_meta = add_enclosure(
+            scene_name,
+            floor_bounds=floor_bounds,
+            floor_top_z=floor_top_z,
+            source_name=floor_source_name,
+        )
+        if len(enclosure_meta) > 0:
+            mesh_meta.extend(enclosure_meta)
+
+        return mesh_list, mesh_meta
+
+    for i in range(start_idx, FLAGS.num_rendering):
+        logger.info(f"Rendering iteration {i}/{FLAGS.num_rendering}")
+        name = f"{i:06d}"
+        if FLAGS.dump_complete:
+            new_complete_file = os.path.join(FLAGS.out_dir, f"COMPLETE_{name}")
+            if os.path.exists(new_complete_file):
+                logger.info(f"COMPLETE_{name} already exists, skip")
+                continue
+        prefix = ''
+        if FLAGS.num_frames > 1:
+            prefix = f"{0:04d}."
+        mesh_list, mesh_meta = None, None
+        for compose_try in range(FLAGS.scene_compose_retry_limit):
+            mesh_list, mesh_meta = compose_scene(name)
+            if mesh_list is not None:
+                if compose_try > 0:
+                    logger.info(
+                        f"Scene {name} succeeded after {compose_try + 1} composition attempts"
+                    )
+                break
+            logger.warning(
+                f"Retrying scene {name} composition "
+                f"({compose_try + 1}/{FLAGS.scene_compose_retry_limit})"
+            )
+
+        if mesh_list is None:
+            raise RuntimeError(
+                f"Failed to place {FLAGS.glbs_per_scene} GLBs in scene {name} after "
+                f"{FLAGS.scene_compose_retry_limit} composition attempts"
+            )
 
         # Render multiple views and dump results
         if not FLAGS.prefix_in_folder:
@@ -996,10 +1299,13 @@ def main():
             new_complete_file = os.path.join(FLAGS.out_dir, f"COMPLETE_{name}")
             open(new_complete_file, 'w').close()
 
-    # clean up and safely exit blender
-    blender_utils.clear_scene()
-    bpy.ops.wm.quit_blender()
-    # sys.exit(0)
+    # The process is about to exit, so avoid one extra Blender teardown pass
+    # here. Final clear_scene()/quit operations have been observed to segfault
+    # after all outputs are already written.
+    return 0
 
 if __name__ == "__main__":
-    main()
+    exit_code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(int(exit_code))

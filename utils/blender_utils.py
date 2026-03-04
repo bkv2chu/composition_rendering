@@ -446,6 +446,25 @@ def apply_object_transform(obj, location, rotation=0):
     obj.rotation_euler = (0, 0, rotation)
 
 
+def get_or_create_render_camera(name='RenderCamera'):
+    """Return a valid camera object, creating one if necessary."""
+    scene = bpy.context.scene
+
+    if scene.camera is not None and getattr(scene.camera, 'type', None) == 'CAMERA':
+        return scene.camera
+
+    for obj in bpy.data.objects:
+        if getattr(obj, 'type', None) == 'CAMERA':
+            scene.camera = obj
+            return obj
+
+    bpy.ops.object.camera_add()
+    camera = bpy.context.active_object
+    camera.name = name
+    scene.camera = camera
+    return camera
+
+
 def setup_camera_pose(cam_pose):
     """Setup camera pose from a 4x4 matrix"""
     # cam_pose: [N, 7] (x, y, z, qw, qx, qy, qz)
@@ -475,16 +494,10 @@ def setup_realtime_camera_update(cam_pose, cam_mode='QUATERNION', fov_sequence=N
     # Remove existing handlers to avoid duplicates
     bpy.app.handlers.frame_change_pre.clear()
 
-    # Get or create camera
-    if 'Camera' in bpy.data.objects:
-        camera = bpy.data.objects['Camera']
-    else:
-        bpy.ops.object.camera_add()
-        camera = bpy.context.active_object
-        camera.name = 'Camera'
-
-    # Set this camera as the active camera for the scene
     scene = bpy.context.scene
+    # Get or create a real camera object. Imported assets may also contain an
+    # object named "Camera" that is not actually a camera.
+    camera = get_or_create_render_camera()
     scene.camera = camera
 
     # Create camera animation with provided poses
@@ -545,19 +558,14 @@ def setup_camera_settings(resolution_x=1920, resolution_y=1080, fov_rad=1.047, c
     # cam_type: 'PERSP', 'PANO'
     scene = bpy.context.scene
 
-    # Ensure we have a camera set for rendering
-    if scene.camera is None:
-        logger.info("Warning: No camera set for rendering. Attempting to find and set a camera.")
-        if 'Camera' in bpy.data.objects:
-            scene.camera = bpy.data.objects['Camera']
-            logger.info("Set 'Camera' as the active camera for rendering.")
+    camera_obj = get_or_create_render_camera()
+    scene.camera = camera_obj
 
     # Set resolution
     scene.render.resolution_x = resolution_x
     scene.render.resolution_y = resolution_y
     scene.render.resolution_percentage = 100
 
-    camera_obj = bpy.data.objects['Camera']
     camera_data = camera_obj.data
     camera_data.clip_start = 0.02
 
@@ -576,6 +584,26 @@ def setup_camera_settings(resolution_x=1920, resolution_y=1080, fov_rad=1.047, c
 def setup_cycles_rendering(samples=128, use_denoise=None, transparent_bg=False):
     """Setup Cycles rendering engine with specified settings"""
     scene = bpy.context.scene
+
+    def enable_denoiser(requested):
+        if not requested:
+            return
+        scene.cycles.use_denoising = True
+        try:
+            scene.cycles.denoiser = requested
+            logger.info(f"Using {requested} denoiser")
+        except TypeError:
+            fallback = 'OPENIMAGEDENOISE'
+            try:
+                scene.cycles.denoiser = fallback
+                logger.warning(
+                    f"Denoiser {requested} is unavailable; falling back to {fallback}"
+                )
+            except TypeError:
+                scene.cycles.use_denoising = False
+                logger.warning(
+                    f"Denoiser {requested} is unavailable and no fallback denoiser is supported; disabling denoising"
+                )
 
     # Set render engine to Cycles
     scene.render.engine = 'CYCLES'
@@ -622,18 +650,11 @@ def setup_cycles_rendering(samples=128, use_denoise=None, transparent_bg=False):
     # Set rendering device based on availability
     if gpu_available:
         # scene.cycles.device = 'GPU'
-        if use_denoise:
-            # Try to use OptiX denoising if available
-            scene.cycles.use_denoising = True
-            scene.cycles.denoiser = use_denoise
-            logger.info(f"Using {use_denoise} denoiser")
+        enable_denoiser(use_denoise)
     else:
         # CPU rendering with OpenImageDenoise
         scene.cycles.device = 'CPU'
-        if use_denoise:
-            scene.cycles.use_denoising = True
-            scene.cycles.denoiser = use_denoise
-            logger.info(f"Using {use_denoise} denoiser")
+        enable_denoiser(use_denoise)
 
     logger.info(f"Cycles setup: {samples} samples, denoising enabled")
 
