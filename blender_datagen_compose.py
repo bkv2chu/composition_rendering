@@ -167,47 +167,8 @@ def post_process_rendering(output_dir, feature_fmt='jpg', dump_video=False, vide
 def render_scene(
     mesh_list, mesh_meta, envlight_path_list, shortname, prefix, FLAGS
 ):
-    cam_radius = FLAGS.radius_range[0] + np.random.uniform() * (FLAGS.radius_range[1] - FLAGS.radius_range[0])
-
-    fovx = np.deg2rad(FLAGS.fov_range[0]+np.random.uniform()*(FLAGS.fov_range[1] - FLAGS.fov_range[0]))
-    fovx_list = None
-    azimuth = np.random.uniform(*FLAGS.cam_phi_range)
-    elevation = np.random.uniform(*FLAGS.cam_theta_range)
-    if FLAGS.cam_t_range is not None:
-        t = np.random.uniform(*FLAGS.cam_t_range, size=[3])
-    else:
-        t = np.zeros(3)
-    
-    cam_matrix = blender_utils.get_cam_matrix(azimuth, elevation, t, cam_radius)
-
     num_frames = FLAGS.num_frames
-    if FLAGS.video_mode == 'orbit_cam':
-        azimuth_offset = np.linspace(0, 2*np.pi, num_frames, endpoint=False)
-        elevation_offset = np.zeros(num_frames)
-    elif FLAGS.video_mode == 'oscil_cam':
-        phi_center = sum(FLAGS.cam_phi_range) / 2
-        phi_ratio = 0.6
-        phi_range = (FLAGS.cam_phi_range[1] - FLAGS.cam_phi_range[0]) / 2
-        phi_range_clip = phi_range * phi_ratio
-        azimuth = np.random.uniform(phi_center - phi_range_clip, phi_center + phi_range_clip)
-        cone_angle = np.random.uniform(0.2 * (1-phi_ratio) * phi_range, phi_range - np.abs(phi_center - azimuth))
-        # azimuth = np.random.uniform(*FLAGS.cam_phi_range)
-        azimuth_offset = np.sin(np.linspace(0, 2*np.pi, num_frames, endpoint=False)) * cone_angle
-        elevation_offset = np.cos(np.linspace(0, 2*np.pi, num_frames, endpoint=False)) * cone_angle
-    elif FLAGS.video_mode == 'dolly_cam':
-        # start_fov
-        fovx_fix = np.deg2rad(45)
-        radius_fix = 2.5
-        fovx_perturb = np.random.uniform(-10, 10, size=2)
-        fovx_motion = np.linspace(
-            max(10, FLAGS.fov_range[0] + fovx_perturb[0]),
-            FLAGS.fov_range[1] + fovx_perturb[1],
-            num_frames, endpoint=True
-        )
-        if random.random() < 0.5:
-            fovx_motion = fovx_motion[::-1]
-        fovx_list = []
-    elif FLAGS.video_mode == 'orbit_lgt':
+    if FLAGS.video_mode == 'orbit_lgt':
         env_rot_offset = np.linspace(0, 2*np.pi, num_frames, endpoint=False)
     elif FLAGS.video_mode == 'rotat_obj':
         obj_rot_offset = np.linspace(0, 2*np.pi, num_frames, endpoint=False)
@@ -240,16 +201,118 @@ def render_scene(
                 drop_offset = np.concatenate([drop_offset, bounce_offset])
             drop_offset_list.append(drop_offset)
 
-    cam_radius_list = None
-    if FLAGS.varying_radius:
-        if random.random() < 0.3:
-            # sin wave 
-            # random roll
-            roll_step = np.random.uniform(-np.pi/2, np.pi/2)
-            cam_radius_list = FLAGS.radius_range[0] + (FLAGS.radius_range[1] - FLAGS.radius_range[0]) * \
-                (1 + np.sin(np.linspace(0, 2*np.pi, num_frames, endpoint=False) + roll_step )) / 2
+    object_spheres = []
+    camera_clearance = float(getattr(FLAGS, 'camera_object_clearance', 0.0) or 0.0)
+    if camera_clearance > 0.0:
+        for mesh in mesh_list[1:]:
+            if mesh is None:
+                continue
+            vmin, vmax = mesh.aabb
+            center = np.array((vmin + vmax) * 0.5, dtype=np.float32)
+            radius = float(np.linalg.norm(np.array(vmax - vmin, dtype=np.float32)) * 0.5)
+            object_spheres.append((center, radius))
 
-    azimuth_0, elevation_0 = azimuth, elevation
+    def sample_camera_path():
+        cam_radius = FLAGS.radius_range[0] + np.random.uniform() * (FLAGS.radius_range[1] - FLAGS.radius_range[0])
+        fovx = np.deg2rad(FLAGS.fov_range[0] + np.random.uniform() * (FLAGS.fov_range[1] - FLAGS.fov_range[0]))
+        azimuth = np.random.uniform(*FLAGS.cam_phi_range)
+        elevation = np.random.uniform(*FLAGS.cam_theta_range)
+        if FLAGS.cam_t_range is not None:
+            t = np.random.uniform(*FLAGS.cam_t_range, size=[3])
+        else:
+            t = np.zeros(3)
+
+        cam_radius_list = None
+        if FLAGS.varying_radius and random.random() < 0.3:
+            roll_step = np.random.uniform(-np.pi / 2, np.pi / 2)
+            cam_radius_list = FLAGS.radius_range[0] + (FLAGS.radius_range[1] - FLAGS.radius_range[0]) * \
+                (1 + np.sin(np.linspace(0, 2*np.pi, num_frames, endpoint=False) + roll_step)) / 2
+
+        azimuth_offset = None
+        elevation_offset = None
+        fovx_motion = None
+        fovx_fix = None
+        radius_fix = None
+        if FLAGS.video_mode == 'orbit_cam':
+            azimuth_offset = np.linspace(0, 2*np.pi, num_frames, endpoint=False)
+            elevation_offset = np.zeros(num_frames)
+        elif FLAGS.video_mode == 'oscil_cam':
+            phi_center = sum(FLAGS.cam_phi_range) / 2
+            phi_ratio = 0.6
+            phi_range = (FLAGS.cam_phi_range[1] - FLAGS.cam_phi_range[0]) / 2
+            phi_range_clip = phi_range * phi_ratio
+            azimuth = np.random.uniform(phi_center - phi_range_clip, phi_center + phi_range_clip)
+            cone_angle = np.random.uniform(0.2 * (1 - phi_ratio) * phi_range, phi_range - np.abs(phi_center - azimuth))
+            azimuth_offset = np.sin(np.linspace(0, 2*np.pi, num_frames, endpoint=False)) * cone_angle
+            elevation_offset = np.cos(np.linspace(0, 2*np.pi, num_frames, endpoint=False)) * cone_angle
+        elif FLAGS.video_mode == 'dolly_cam':
+            fovx_fix = np.deg2rad(45)
+            radius_fix = 2.5
+            fovx_perturb = np.random.uniform(-10, 10, size=2)
+            fovx_motion = np.linspace(
+                max(10, FLAGS.fov_range[0] + fovx_perturb[0]),
+                FLAGS.fov_range[1] + fovx_perturb[1],
+                num_frames,
+                endpoint=True,
+            )
+            if random.random() < 0.5:
+                fovx_motion = fovx_motion[::-1]
+
+        azimuth_0, elevation_0 = azimuth, elevation
+        cam_list = []
+        frame_info_list = []
+        fovx_list = [] if FLAGS.video_mode == 'dolly_cam' else None
+        for it in range(num_frames):
+            azimuth_frame = azimuth_0
+            elevation_frame = elevation_0
+            radius_frame = cam_radius
+            fovx_frame = fovx
+
+            if FLAGS.video_mode in ['orbit_cam', 'oscil_cam']:
+                azimuth_frame = azimuth_0 + azimuth_offset[it]
+                elevation_frame = elevation_0 + elevation_offset[it]
+                elevation_frame = np.clip(elevation_frame, 5 * np.pi / 180, 85 * np.pi / 180)
+            elif FLAGS.video_mode == 'dolly_cam':
+                fovx_frame = np.deg2rad(fovx_motion[it])
+                radius_frame = radius_fix * np.tan(fovx_fix / 2) / np.tan(fovx_frame / 2)
+                fovx_list.append(fovx_frame)
+
+            if FLAGS.varying_radius and cam_radius_list is not None and FLAGS.video_mode != 'dolly_cam':
+                radius_frame = cam_radius_list[it]
+
+            cam_matrix = blender_utils.get_cam_matrix(azimuth_frame, elevation_frame, t, radius_frame)
+            cam_list.append(cam_matrix)
+            frame_info = {
+                'azimuth': azimuth_frame,
+                'elevation': elevation_frame,
+            }
+            if FLAGS.video_mode == 'dolly_cam':
+                frame_info['fov'] = fovx_frame
+            frame_info_list.append(frame_info)
+
+        return cam_radius, fovx, t, cam_list, frame_info_list, fovx_list
+
+    def camera_path_has_clearance(cam_list):
+        if camera_clearance <= 0.0 or len(object_spheres) == 0:
+            return True
+        for cam_matrix in cam_list:
+            cam_pos = np.array(cam_matrix[:3, 3], dtype=np.float32)
+            for center, radius in object_spheres:
+                if np.linalg.norm(cam_pos - center) < (radius + camera_clearance):
+                    return False
+        return True
+
+    camera_retry_limit = int(getattr(FLAGS, 'camera_sample_retry_limit', 25) or 25)
+    for camera_try in range(camera_retry_limit):
+        cam_radius, fovx, t, cam_list, frame_info_list, fovx_list = sample_camera_path()
+        if camera_path_has_clearance(cam_list):
+            break
+    else:
+        raise RuntimeError(
+            f"Failed to sample a camera path with object clearance {camera_clearance} "
+            f"after {camera_retry_limit} attempts"
+        )
+
     cubemap, vec, vec_ref, latlong_img = None, None, None, None
     if FLAGS.dump_envmap: # TODO:
         vec = render_utils.latlong_vec(FLAGS.resolution)
@@ -327,32 +390,18 @@ def render_scene(
         # =============================================================================================
         # Start rendering
         # =============================================================================================
-        cam_list = []
         for it in range(num_frames):
-            if FLAGS.video_mode in ['orbit_cam', 'oscil_cam']:
-                azimuth = azimuth_0 + azimuth_offset[it]
-                elevation = elevation_0 + elevation_offset[it]
-                # to avoid camera or object flipping
-                elevation = np.clip(elevation, 5*np.pi/180, 85*np.pi/180)
-                cam_matrix = blender_utils.get_cam_matrix(azimuth, elevation, t, cam_radius)
-                
-            elif FLAGS.video_mode == 'orbit_lgt':
+            frame_info = frame_info_list[it]
+            azimuth = frame_info['azimuth']
+            elevation = frame_info['elevation']
+            cam_matrix = cam_list[it]
+
+            if FLAGS.video_mode == 'orbit_lgt':
                 envmap_rotation_y = envmap_rotation_y_0 + env_rot_offset[it]
                 # blender_utils.rotate_envmap(envmap_rotation_y) # TODO:
                         
             elif FLAGS.video_mode == 'vtran_obj':
                 pass
-            elif FLAGS.video_mode == 'dolly_cam':
-                fovx_frame = np.deg2rad(fovx_motion[it])
-                radius_frame = radius_fix * np.tan(fovx_fix/2) / np.tan(fovx_frame/2)
-                cam_matrix = blender_utils.get_cam_matrix(azimuth, elevation, t, radius_frame)
-                fovx_list.append(fovx_frame)
-
-            if FLAGS.varying_radius and cam_radius_list is not None and FLAGS.video_mode != 'dolly_cam':
-                cam_radius = cam_radius_list[it]
-                cam_matrix = blender_utils.get_cam_matrix(azimuth, elevation, t, cam_radius)
-            
-            cam_list.append(cam_matrix)
 
             if FLAGS.dump_envmap:
                 c2w = render_utils.convert_cam_mat_blender_to_dr(cam_matrix)
@@ -403,7 +452,7 @@ def render_scene(
                 meta_frame['drop_offset'] = [drop_offset_list[i][it] for i in range(num_drop)]
                 meta_frame['drop_id'] = drop_id
             if FLAGS.video_mode == 'dolly_cam':
-                meta_frame['fov'] = fovx_frame
+                meta_frame['fov'] = frame_info['fov']
 
             meta_frames.append(meta_frame)
 
@@ -454,22 +503,27 @@ def render_scene(
 class GLTFFileManger:
     def __init__(
         self, files, random_sample=True, rescale=True, 
-        multi_sample_weight=None, check_bbox=False
+        multi_sample_weight=None, check_bbox=False, file_weights=None
     ):
         # just assume files is a list of list of files
         self.files = files
-        self.files_list = []
-        for f in files:
-            self.files_list.extend(f)
         self.num_file_lists = len(files)
-
-        self.num_files = len(self.files_list)
         self.random_sample = random_sample
         self.rescale = rescale
         self.multi_sample_weight = multi_sample_weight
         self.check_bbox = check_bbox
+        self.file_weights = None
         if self.multi_sample_weight is not None:
             assert len(self.multi_sample_weight) == self.num_file_lists
+            self.multi_sample_weight = np.array(self.multi_sample_weight, dtype=np.float64)
+        if file_weights is not None:
+            assert len(file_weights) == self.num_file_lists
+            self.file_weights = [
+                np.array(weights, dtype=np.float64) if weights is not None else None
+                for weights in file_weights
+            ]
+        self._rebuild_files_list()
+        self._normalize_file_weights()
             
     def __len__(self):
         return self.num_files
@@ -478,23 +532,81 @@ class GLTFFileManger:
         self.idx = 0
         return self
 
+    def _rebuild_files_list(self):
+        self.files_list = []
+        for file_group in self.files:
+            self.files_list.extend(file_group)
+        self.num_files = len(self.files_list)
+
+    def _normalize_file_weights(self):
+        if self.file_weights is None:
+            return
+        for i, weights in enumerate(self.file_weights):
+            if weights is None:
+                continue
+            if len(weights) != len(self.files[i]):
+                raise ValueError("file_weights must match files layout")
+            if len(weights) == 0:
+                continue
+            total = float(weights.sum())
+            if total <= 0:
+                weights = np.ones(len(weights), dtype=np.float64)
+                total = float(weights.sum())
+            self.file_weights[i] = weights / total
+
+    def _list_sampling_weights(self):
+        active = np.array([len(group) > 0 for group in self.files], dtype=np.float64)
+        if active.sum() == 0:
+            raise StopIteration("No asset files remaining")
+        if self.multi_sample_weight is None:
+            return active / active.sum()
+        weights = self.multi_sample_weight.copy()
+        weights *= active
+        total = float(weights.sum())
+        if total <= 0:
+            return active / active.sum()
+        return weights / total
+
+    def _find_file_indices(self, file):
+        for list_idx, file_group in enumerate(self.files):
+            for file_idx, candidate in enumerate(file_group):
+                if candidate == file:
+                    return list_idx, file_idx
+        return None, None
+
+    def _remove_file(self, list_idx, file_idx):
+        del self.files[list_idx][file_idx]
+        if self.file_weights is not None and self.file_weights[list_idx] is not None:
+            self.file_weights[list_idx] = np.delete(self.file_weights[list_idx], file_idx)
+        self._rebuild_files_list()
+        self._normalize_file_weights()
+
     def __next__(self): # inifi-gen
         self.idx += 1
         sample_success = False
         obj_mesh = None
         while not sample_success:
+            if self.num_files == 0:
+                raise StopIteration("No asset files remaining")
+            idx = None
+            file_idx = None
             if self.random_sample:
-                idx = np.random.choice(self.num_file_lists, p=self.multi_sample_weight)
-                file = np.random.choice(self.files[idx])
+                idx = int(np.random.choice(self.num_file_lists, p=self._list_sampling_weights()))
+                if self.file_weights is not None and self.file_weights[idx] is not None:
+                    file_idx = int(np.random.choice(len(self.files[idx]), p=self.file_weights[idx]))
+                else:
+                    file_idx = int(np.random.choice(len(self.files[idx])))
+                file = self.files[idx][file_idx]
             else:
                 file = self.files_list[(self.idx-1) % self.num_files]
+                idx, file_idx = self._find_file_indices(file)
                 sample_success = True
             try:
                 logger.info(f'Processing: {file}')
                 _obj_mesh = blender_utils.add_object_file(
                     file, with_empty=True, recenter=True, rescale=self.rescale
                 )
-                if self.check_bbox and not check_msh_bbox(obj_mesh):
+                if self.check_bbox and not check_msh_bbox(_obj_mesh):
                     _obj_mesh.clear_objects()
                     del _obj_mesh
                     raise Exception('Invalid bbox')
@@ -503,9 +615,127 @@ class GLTFFileManger:
                     sample_success = True
             except Exception as e:
                 logger.info(f'---> Error: {e}, skipping file {file}')
-                self.files[idx].remove(file)
+                if idx is not None and file_idx is not None:
+                    self._remove_file(idx, file_idx)
+                if self.num_files == 0:
+                    raise StopIteration("No asset files remaining after filtering failures")
         
         return {'mesh': obj_mesh, 'name': file}
+
+
+def load_asset_export_cost_manifest(manifest_path):
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    entries = payload.get("entries", payload) if isinstance(payload, dict) else payload
+    manifest = {}
+    for entry in entries:
+        asset_path = entry.get("asset_path") or entry.get("name")
+        if not asset_path:
+            continue
+        manifest[canonicalize_asset_path(asset_path)] = entry
+    return manifest
+
+
+def canonicalize_asset_path(path):
+    return os.path.realpath(os.path.abspath(os.fspath(path)))
+
+
+def asset_export_cost_rejection_reason(entry, flags):
+    if entry is None:
+        if FLAGS_VALUE(flags, "glbs_require_export_cost_manifest", False):
+            return "missing manifest entry"
+        return None
+
+    if entry.get("status", "ok") != "ok":
+        return f"manifest status={entry.get('status')}"
+
+    checks = [
+        ("glbs_max_mesh_objects", "mesh_objects", "mesh_objects"),
+        ("glbs_max_baked_meshes", "baked_mesh_objects", "baked_mesh_objects"),
+        (
+            "glbs_max_unique_baked_materials",
+            "unique_baked_materials",
+            "unique_baked_materials",
+        ),
+        ("glbs_max_baked_ratio", "baked_object_ratio", "baked_object_ratio"),
+    ]
+    for flag_name, entry_key, label in checks:
+        limit = FLAGS_VALUE(flags, flag_name, None)
+        value = entry.get(entry_key)
+        if limit is not None and value is not None and value > limit:
+            return f"{label}={value} exceeds {limit}"
+    return None
+
+
+def compute_asset_export_cost_weight(entry, flags):
+    if entry is None or entry.get("status", "ok") != "ok":
+        return 1.0
+    if not FLAGS_VALUE(flags, "glbs_downweight_export_cost", False):
+        return 1.0
+
+    baked_meshes = float(entry.get("baked_mesh_objects", 0))
+    unique_baked_materials = float(entry.get("unique_baked_materials", 0))
+    mesh_objects = float(entry.get("mesh_objects", 0))
+    score = (
+        baked_meshes
+        + float(FLAGS_VALUE(flags, "glbs_export_cost_material_penalty", 25.0))
+        * unique_baked_materials
+        + float(FLAGS_VALUE(flags, "glbs_export_cost_mesh_penalty", 0.0)) * mesh_objects
+    )
+    scale = float(FLAGS_VALUE(flags, "glbs_export_cost_weight_scale", 0.01))
+    min_weight = float(FLAGS_VALUE(flags, "glbs_export_cost_weight_min", 0.05))
+    weight = math.exp(-scale * score)
+    return max(min_weight, weight)
+
+
+def filter_asset_files_by_export_cost(obj_files, manifest, flags):
+    filtered_files = []
+    file_weights = []
+    kept = 0
+    dropped = []
+    missing = 0
+
+    for file_group in obj_files:
+        filtered_group = []
+        weights_group = []
+        for file in file_group:
+            asset_path = canonicalize_asset_path(file)
+            entry = manifest.get(asset_path)
+            reason = asset_export_cost_rejection_reason(entry, flags)
+            if reason is not None:
+                dropped.append((asset_path, reason))
+                continue
+            if entry is None:
+                missing += 1
+            filtered_group.append(asset_path)
+            weights_group.append(compute_asset_export_cost_weight(entry, flags))
+            kept += 1
+        filtered_files.append(filtered_group)
+        file_weights.append(weights_group)
+
+    total = sum(len(group) for group in obj_files)
+    logger.info(
+        f"Asset export-cost manifest kept {kept}/{total} assets, "
+        f"dropped {len(dropped)}, missing entries {missing}"
+    )
+    if missing:
+        logger.warning(
+            "Asset export-cost manifest missed %d asset paths after canonicalization",
+            missing,
+        )
+    for asset_path, reason in dropped[:10]:
+        logger.info(f"Manifest drop: {asset_path} ({reason})")
+
+    if kept == 0:
+        raise RuntimeError("All assets were filtered out by glbs_export_cost_manifest settings")
+
+    return filtered_files, file_weights
+
+
+def FLAGS_VALUE(flags, key, default):
+    value = getattr(flags, key, default)
+    return default if value is None else value
     
 def main():
     # Parse --config and support legacy flags; additional overrides use OmegaConf dotlist (key=val)
@@ -535,6 +765,8 @@ def main():
         'transparent_bg': True,
         'radius_range': [2.0, 4.0],
         'varying_radius': False,
+        'camera_object_clearance': 0.0,
+        'camera_sample_retry_limit': 25,
         'num_files': None,
         'random_env_rotation': True,
         'random_env_flip': True,
@@ -571,6 +803,17 @@ def main():
         'glbs_random_sample': True,
         'glbs_per_scene': 2,
         'glbs_max_sample_tries_per_scene': None,
+        'glbs_export_cost_manifest': None,
+        'glbs_require_export_cost_manifest': False,
+        'glbs_max_mesh_objects': None,
+        'glbs_max_baked_meshes': None,
+        'glbs_max_unique_baked_materials': None,
+        'glbs_max_baked_ratio': None,
+        'glbs_downweight_export_cost': False,
+        'glbs_export_cost_weight_scale': 0.01,
+        'glbs_export_cost_weight_min': 0.05,
+        'glbs_export_cost_material_penalty': 25.0,
+        'glbs_export_cost_mesh_penalty': 0.0,
         'glbs_scale_range': [1.0, 1.5],
         'glbs_rotation_range': [-45, 45],
         'glbs_placement_bbox': [-1.0, -1.0, 1.0, 1.0],
@@ -894,6 +1137,12 @@ def main():
     else:
         raise NotImplementedError("Objaverse is not supported yet")
 
+    file_weights = None
+    if FLAGS.glbs_export_cost_manifest is not None:
+        manifest_path = os.path.abspath(FLAGS.glbs_export_cost_manifest)
+        manifest = load_asset_export_cost_manifest(manifest_path)
+        obj_files, file_weights = filter_asset_files_by_export_cost(obj_files, manifest, FLAGS)
+
    
     # obj dataloader
     obj_dataloader = GLTFFileManger(
@@ -901,7 +1150,8 @@ def main():
         random_sample=FLAGS.glbs_random_sample, 
         rescale=FLAGS.glbs_rescale, 
         multi_sample_weight=FLAGS.glbs_multi_sample_weight, 
-        check_bbox=FLAGS.glbs_check_bbox
+        check_bbox=FLAGS.glbs_check_bbox,
+        file_weights=file_weights,
     )
     logger.info(f"Use {len(obj_dataloader)} glbs")
     if FLAGS.glbs_max_sample_tries_per_scene is None:

@@ -678,7 +678,7 @@ def setup_render_passes(ext_passes=None):
     if 'material' in ext_passes:
         view_layer.use_pass_cryptomatte_material = True
 
-    logger.info("Render passes enabled: RGB, Normal, Depth, Diffuse Color")
+    logger.info("Render passes enabled: RGB")
 
 
 def setup_compositor_nodes(output_dir, passes=None, suffix=''):
