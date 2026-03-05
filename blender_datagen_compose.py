@@ -1011,7 +1011,7 @@ def main():
                     break
                 
             if not find_placement:
-                logger.info(f'Cannot find valid placement for {mesh_name}')
+                logger.error(f'\033[91mCannot find valid placement for {mesh_name}\033[0m')
                 ref_mesh.clear_objects()
                 del ref_mesh
                 return None
@@ -1208,6 +1208,23 @@ def main():
         principled.inputs['Metallic'].default_value = float(metallic)
         return material
 
+    def create_diffuse_material(name, base_color):
+        material = bpy.data.materials.new(name=name)
+        material.use_nodes = True
+        nodes = material.node_tree.nodes
+        links = material.node_tree.links
+        nodes.clear()
+
+        output = nodes.new(type='ShaderNodeOutputMaterial')
+        output.location = (200, 0)
+        diffuse = nodes.new(type='ShaderNodeBsdfDiffuse')
+        diffuse.location = (0, 0)
+        links.new(diffuse.outputs['BSDF'], output.inputs['Surface'])
+        diffuse.inputs['Color'].default_value = (
+            float(base_color[0]), float(base_color[1]), float(base_color[2]), 1.0
+        )
+        return material
+
     def add_box_primitive(name, size_xyz, location, material, flip_normals=False):
         bpy.ops.mesh.primitive_cube_add(size=1.0, location=location)
         obj = bpy.context.active_object
@@ -1237,16 +1254,32 @@ def main():
         floor_color = enclosure_cfg.get('color', [0.85, 0.85, 0.85])
         floor_roughness = float(enclosure_cfg.get('roughness', 0.8))
         floor_metallic = float(enclosure_cfg.get('metallic', 0.0))
+        floor_material_kind = str(enclosure_cfg.get('floor_material', 'principled')).lower()
+        if floor_material_kind not in {'principled', 'diffuse'}:
+            logger.warning(
+                f"Unknown enclosure.floor_material={floor_material_kind!r}; using principled."
+            )
+            floor_material_kind = 'principled'
+        if floor_material_kind == 'diffuse':
+            # Keep diffuse floors textureless, matching enclosure wall appearance.
+            texture_path = None
+            texture_scale = None
 
         size_x, size_y = float(size_xy[0]), float(size_xy[1])
         center_x, center_y = float(center_xy[0]), float(center_xy[1])
+        if floor_material_kind == 'diffuse':
+            floor_material = create_diffuse_material(
+                f"FloorMaterial_{scene_name}", floor_color
+            )
+        else:
+            floor_material = create_principled_material(
+                f"FloorMaterial_{scene_name}", floor_color, floor_roughness, floor_metallic
+            )
         floor_obj = add_box_primitive(
             f"{scene_name}_floor",
             (size_x, size_y, float(thickness)),
             (center_x, center_y, float(top_z) - float(thickness) / 2.0),
-            create_principled_material(
-                f"FloorMaterial_{scene_name}", floor_color, floor_roughness, floor_metallic
-            ),
+            floor_material,
             flip_normals=False,
         )
         floor_container = blender_utils.ObjContainer(
